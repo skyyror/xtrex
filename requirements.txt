@@ -1,0 +1,5 @@
+# X-TREX — TIDAK BUTUH dependency eksternal.
+# Semua fitur berjalan dengan stdlib Python 3.8+.
+# File ini cuma untuk referensi kalau mau extend:
+# rich>=13.0.0     # kalau mau tabel UI lebih kaya
+# pyfiglet         # banner alternate
